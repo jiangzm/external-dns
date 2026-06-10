@@ -66,6 +66,7 @@ TTL must be a positive value.
 | `PiHole`       |    Yes    |
 | `RFC2136`      |    Yes    |
 | `Scaleway`     |    Yes    |
+| `TencentCloud` |    Yes    |
 | `Webhook`      |    Yes    |
 
 ### Sources

@@ -44,6 +44,7 @@ import (
 	"sigs.k8s.io/external-dns/provider/pihole"
 	"sigs.k8s.io/external-dns/provider/rfc2136"
 	"sigs.k8s.io/external-dns/provider/scaleway"
+	"sigs.k8s.io/external-dns/provider/tencentcloud"
 	"sigs.k8s.io/external-dns/provider/webhook"
 )
 
@@ -100,6 +101,7 @@ func providers(selector string) (ProviderConstructor, bool) {
 		externaldns.ProviderPihole:       pihole.New,
 		externaldns.ProviderRFC2136:      rfc2136.New,
 		externaldns.ProviderScaleway:     scaleway.New,
+		externaldns.ProviderTencentCloud: tencentcloud.New,
 		externaldns.ProviderWebhook:      webhook.New,
 	}
 	c, ok := m[selector]

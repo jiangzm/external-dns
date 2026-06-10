@@ -26,4 +26,5 @@ Provider supported configurations
 | PiHole        | n/a        | yes     | n/a                   |
 | RFC2136       | n/a        | yes     | n/a                   |
 | Scaleway      | n/a        | n/a     | 300                   |
+| TencentCloud  | n/a        | n/a     | n/a                   |
 | Webhook       | n/a        | n/a     | n/a                   |

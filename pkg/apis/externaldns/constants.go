@@ -47,5 +47,6 @@ const (
 	ProviderPihole       = "pihole"
 	ProviderRFC2136      = "rfc2136"
 	ProviderScaleway     = "scaleway"
+	ProviderTencentCloud = "tencentcloud"
 	ProviderWebhook      = "webhook"
 )
