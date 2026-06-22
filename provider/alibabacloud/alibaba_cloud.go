@@ -19,34 +19,35 @@ package alibabacloud
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"slices"
-	"sort"
 	"strings"
-	"sync"
-	"time"
 
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk"
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth"
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/alidns"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/pvtz"
-	"github.com/denverdino/aliyungo/metadata"
 	"github.com/goccy/go-yaml"
 	log "github.com/sirupsen/logrus"
 
-	"sigs.k8s.io/external-dns/pkg/apis/externaldns"
-
 	"sigs.k8s.io/external-dns/endpoint"
+	"sigs.k8s.io/external-dns/pkg/apis/externaldns"
 	"sigs.k8s.io/external-dns/plan"
 	"sigs.k8s.io/external-dns/provider"
 )
 
 const (
-	defaultTTL                              = 600
-	defaultAlibabaCloudPrivateZoneRecordTTL = 60
-	defaultAlibabaCloudPageSize             = 50
-	nullHostAlibabaCloud                    = "@"
-	pVTZDoamin                              = "pvtz.aliyuncs.com"
-	defaultAlibabaCloudRequestScheme        = "https"
+	apexRecord      = "@"
+	defaultDnsTTL   = 600
+	defaultPvtTTL   = 60
+	defaultPageSize = 50
+	defaultScheme   = "https"
+	pvtzEndpoint    = "pvtz.aliyuncs.com"
+	alidnsEndpoint  = "alidns.aliyuncs.com"
 )
 
 // AlibabaCloudDNSAPI is a minimal implementation of DNS API that we actually use, used primarily for unit testing.
@@ -59,9 +60,9 @@ type AlibabaCloudDNSAPI interface {
 	DescribeDomains(request *alidns.DescribeDomainsRequest) (*alidns.DescribeDomainsResponse, error)
 }
 
-// AlibabaCloudPrivateZoneAPI is a minimal implementation of Private Zone API that we actually use, used primarily for unit testing.
+// AlibabaCloudZoneAPI is a minimal implementation of Private Zone API that we actually use, used primarily for unit testing.
 // See https://help.aliyun.com/document_detail/66234.html for descriptions of all of its methods.
-type AlibabaCloudPrivateZoneAPI interface {
+type AlibabaCloudZoneAPI interface {
 	AddZoneRecord(request *pvtz.AddZoneRecordRequest) (*pvtz.AddZoneRecordResponse, error)
 	DeleteZoneRecord(request *pvtz.DeleteZoneRecordRequest) (*pvtz.DeleteZoneRecordResponse, error)
 	UpdateZoneRecord(request *pvtz.UpdateZoneRecordRequest) (*pvtz.UpdateZoneRecordResponse, error)
@@ -73,28 +74,22 @@ type AlibabaCloudPrivateZoneAPI interface {
 // AlibabaCloudProvider implements the DNS provider for Alibaba Cloud.
 type AlibabaCloudProvider struct {
 	provider.BaseProvider
-	domainFilter         *endpoint.DomainFilter
-	zoneIDFilter         provider.ZoneIDFilter // Private Zone only
-	MaxChangeCount       int
-	EvaluateTargetHealth bool
-	AssumeRole           string
-	vpcID                string // Private Zone only
-	dryRun               bool
-	dnsClient            AlibabaCloudDNSAPI
-	pvtzClient           AlibabaCloudPrivateZoneAPI
-	privateZone          bool
-	clientLock           sync.RWMutex
-	nextExpire           time.Time
+	domainFilter *endpoint.DomainFilter
+	zoneIDFilter provider.ZoneIDFilter // Private Zone only
+	vpcID        string                // Private Zone only
+	dryRun       bool
+	dnsClient    AlibabaCloudDNSAPI
+	pvtzClient   AlibabaCloudZoneAPI
+	privateZone  bool
 }
 
 type alibabaCloudConfig struct {
-	RegionID        string    `json:"regionId"        yaml:"regionId"`
-	AccessKeyID     string    `json:"accessKeyId"     yaml:"accessKeyId"`
-	AccessKeySecret string    `json:"accessKeySecret" yaml:"accessKeySecret"`
-	VPCID           string    `json:"vpcId"           yaml:"vpcId"`
-	RoleName        string    `json:"-"               yaml:"-"` // For ECS RAM role only
-	StsToken        string    `json:"-"               yaml:"-"`
-	ExpireTime      time.Time `json:"-"               yaml:"-"`
+	RegionID        string `json:"regionId"        yaml:"regionId"`
+	AccessKeyID     string `json:"accessKeyId"     yaml:"accessKeyId"`
+	AccessKeySecret string `json:"accessKeySecret" yaml:"accessKeySecret"`
+	VPCID           string `json:"vpcId"           yaml:"vpcId"`
+	RoleName        string `json:"roleName"        yaml:"roleName"` // For ECS RAM role only
+	RoleArn         string `json:"roleArn"         yaml:"roleArn"`  // For OIDC RoleArn only
 }
 
 // New creates an Alibaba Cloud provider from the given configuration.
@@ -110,183 +105,115 @@ func newProvider(configFile string, domainFilter *endpoint.DomainFilter, zoneIDF
 	if configFile != "" {
 		contents, err := os.ReadFile(configFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read Alibaba Cloud config file '%s': %w", configFile, err)
+			return nil, fmt.Errorf("Failed to read Alibaba Cloud config file '%s': %w", configFile, err)
 		}
 		err = yaml.Unmarshal(contents, &cfg)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse Alibaba Cloud config file '%s': %w", configFile, err)
+			return nil, fmt.Errorf("Failed to parse Alibaba Cloud config file '%s': %w", configFile, err)
+		}
+	}
+
+	var err error
+	var credential auth.Credential
+	if cfg.AccessKeyID != "" {
+		credential = &credentials.AccessKeyCredential{
+			AccessKeyId:     cfg.AccessKeyID,
+			AccessKeySecret: cfg.AccessKeySecret,
 		}
 	} else {
-		var tmpError error
-		cfg, tmpError = getCloudConfigFromStsToken()
-		if tmpError != nil {
-			return nil, fmt.Errorf("failed to getCloudConfigFromStsToken: %w", tmpError)
+		roleName, roleArn := cfg.RoleName, cfg.RoleArn
+		if roleName == "" && roleArn == "" {
+			roleArn = os.Getenv("ALIBABA_CLOUD_ROLE_ARN")
+			roleName, _ = getMetadata(MetadataKeys.RoleName)
+		}
+		if roleArn != "" {
+			credential, err = credentials.NewOIDCCredentialsProviderBuilder().
+				WithRoleArn(roleArn).
+				WithRoleSessionName("external-dns").
+				WithDurationSeconds(3600).
+				Build()
+		} else if roleName != "" {
+			credential = &credentials.EcsRamRoleCredential{
+				RoleName: roleName,
+			}
+		} else {
+			credential = credentials.NewDefaultCredentialsProvider()
 		}
 	}
 
 	// Public DNS service
-	var dnsClient AlibabaCloudDNSAPI
-	var err error
-
-	if cfg.RoleName == "" {
-		dnsClient, err = alidns.NewClientWithAccessKey(
-			cfg.RegionID,
-			cfg.AccessKeyID,
-			cfg.AccessKeySecret,
-		)
-	} else {
-		dnsClient, err = alidns.NewClientWithStsToken(
-			cfg.RegionID,
-			cfg.AccessKeyID,
-			cfg.AccessKeySecret,
-			cfg.StsToken,
-		)
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Alibaba Cloud DNS client: %w", err)
-	}
-
+	var dnsClient *alidns.Client
 	// Private DNS service
-	var pvtzClient AlibabaCloudPrivateZoneAPI
-	if cfg.RoleName == "" {
-		pvtzClient, err = pvtz.NewClientWithAccessKey(
-			"cn-hangzhou", // The Private Zone location is fixed
-			cfg.AccessKeyID,
-			cfg.AccessKeySecret,
-		)
-	} else {
-		pvtzClient, err = pvtz.NewClientWithStsToken(
-			cfg.RegionID,
-			cfg.AccessKeyID,
-			cfg.AccessKeySecret,
-			cfg.StsToken,
-		)
-	}
+	var pvtzClient *pvtz.Client
 
-	if err != nil {
-		return nil, err
+	privateZone := zoneType == "private"
+	regionID, vpcID := cfg.RegionID, cfg.VPCID
+	config := sdk.NewConfig().WithScheme(defaultScheme)
+
+	if !privateZone {
+		dnsClient, err := alidns.NewClientWithOptions(regionID, config, credential)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to create Alibaba Cloud DNS client: %w", err)
+		}
+		dnsClient.Domain = alidnsEndpoint
+	} else {
+		if vpcID == "" {
+			vpcID, _ = getMetadata(MetadataKeys.VpcID)
+		}
+		pvtzClient, err = pvtz.NewClientWithOptions(regionID, config, credential)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to create Alibaba Cloud PrivateZone client: %w", err)
+		}
+		pvtzClient.Domain = pvtzEndpoint
 	}
 
 	provider := &AlibabaCloudProvider{
 		domainFilter: domainFilter,
 		zoneIDFilter: zoneIDFileter,
-		vpcID:        cfg.VPCID,
+		vpcID:        vpcID,
 		dryRun:       dryRun,
 		dnsClient:    dnsClient,
 		pvtzClient:   pvtzClient,
-		privateZone:  zoneType == "private",
+		privateZone:  privateZone,
 	}
 
-	if cfg.RoleName != "" {
-		provider.setNextExpire(cfg.ExpireTime)
-		go provider.refreshStsToken(1 * time.Second)
-	}
 	return provider, nil
 }
 
-func getCloudConfigFromStsToken() (alibabaCloudConfig, error) {
-	cfg := alibabaCloudConfig{}
-	// Load config from Metadata Service
-	m := metadata.NewMetaData(nil)
-	roleName := ""
-	var err error
-	if roleName, err = m.RoleName(); err != nil {
-		return cfg, fmt.Errorf("failed to get role name from Metadata Service: %w", err)
-	}
-	vpcID, err := m.VpcID()
+type MetadataKey string
+
+var MetadataKeys = struct {
+	VpcID    MetadataKey
+	RegionID MetadataKey
+	RoleName MetadataKey
+}{
+	VpcID:    "vpc-id",
+	RegionID: "region-id",
+	RoleName: "ram/security-credentials/",
+}
+
+// Get metadata bound to Alibaba Cloud ECS
+// https://help.aliyun.com/en/ecs/user-guide/view-instance-metadata
+// Return query results by metadata key
+func getMetadata(key MetadataKey) (string, error) {
+	baseURL := "http://100.100.100.200/latest/meta-data/"
+	url := baseURL + strings.TrimPrefix(string(key), "/")
+	res, err := http.Get(url)
 	if err != nil {
-		return cfg, fmt.Errorf("failed to get VPC ID from Metadata Service: %w", err)
+		return "", err
 	}
-	regionID, err := m.Region()
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status code: %d", res.StatusCode)
+	}
+
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return cfg, fmt.Errorf("failed to get Region ID from Metadata Service: %w", err)
+		return "", err
 	}
-	role, err := m.RamRoleToken(roleName)
-	if err != nil {
-		return cfg, fmt.Errorf("failed to get STS Token from Metadata Service: %w", err)
-	}
-	cfg.RegionID = regionID
-	cfg.RoleName = roleName
-	cfg.VPCID = vpcID
-	cfg.AccessKeyID = role.AccessKeyId
-	cfg.AccessKeySecret = role.AccessKeySecret
-	cfg.StsToken = role.SecurityToken
-	cfg.ExpireTime = role.Expiration
-	return cfg, nil
-}
 
-func (p *AlibabaCloudProvider) getDNSClient() AlibabaCloudDNSAPI {
-	p.clientLock.RLock()
-	defer p.clientLock.RUnlock()
-	return p.dnsClient
-}
-
-func (p *AlibabaCloudProvider) getPvtzClient() AlibabaCloudPrivateZoneAPI {
-	p.clientLock.RLock()
-	defer p.clientLock.RUnlock()
-	return p.pvtzClient
-}
-
-func (p *AlibabaCloudProvider) setNextExpire(expireTime time.Time) {
-	p.clientLock.Lock()
-	defer p.clientLock.Unlock()
-	p.nextExpire = expireTime
-}
-
-func (p *AlibabaCloudProvider) refreshStsToken(sleepTime time.Duration) {
-	for {
-		time.Sleep(sleepTime)
-		now := time.Now()
-		utcLocation, err := time.LoadLocation("")
-		if err != nil {
-			log.Errorf("Get utc time error %v", err)
-			continue
-		}
-		nowTime := now.In(utcLocation)
-		p.clientLock.RLock()
-		sleepTime = p.nextExpire.Sub(nowTime)
-		p.clientLock.RUnlock()
-		log.Infof("Distance expiration time %v", sleepTime)
-		if sleepTime < 10*time.Minute {
-			sleepTime = time.Second * 1
-		} else {
-			sleepTime = 9 * time.Minute
-			log.Info("Next fetch sts sleep interval : ", sleepTime.String())
-			continue
-		}
-		cfg, err := getCloudConfigFromStsToken()
-		if err != nil {
-			log.Errorf("Failed to getCloudConfigFromStsToken: %v", err)
-			continue
-		}
-		dnsClient, err := alidns.NewClientWithStsToken(
-			cfg.RegionID,
-			cfg.AccessKeyID,
-			cfg.AccessKeySecret,
-			cfg.StsToken,
-		)
-		if err != nil {
-			log.Errorf("Failed to new client with sts token %v", err)
-			continue
-		}
-		pvtzClient, err := pvtz.NewClientWithStsToken(
-			cfg.RegionID,
-			cfg.AccessKeyID,
-			cfg.AccessKeySecret,
-			cfg.StsToken,
-		)
-		if err != nil {
-			log.Errorf("Failed to new client with sts token %v", err)
-			continue
-		}
-		log.Infof("Refresh client from sts token, next expire time %v", cfg.ExpireTime)
-		p.clientLock.Lock()
-		p.dnsClient = dnsClient
-		p.pvtzClient = pvtzClient
-		p.nextExpire = cfg.ExpireTime
-		p.clientLock.Unlock()
-	}
+	return strings.TrimSpace(string(body)), nil
 }
 
 // Records gets the current records.
@@ -294,151 +221,101 @@ func (p *AlibabaCloudProvider) refreshStsToken(sleepTime time.Duration) {
 // Returns the current records or an error if the operation failed.
 func (p *AlibabaCloudProvider) Records(_ context.Context) ([]*endpoint.Endpoint, error) {
 	if p.privateZone {
-		return p.privateZoneRecords()
-	} else {
-		return p.recordsForDNS()
+		return p.zoneRecords()
 	}
+	return p.dnsRecords()
 }
 
 // ApplyChanges applies the given changes.
 //
 // Returns nil if the operation was successful or an error if the operation failed.
 func (p *AlibabaCloudProvider) ApplyChanges(_ context.Context, changes *plan.Changes) error {
-	if changes == nil || len(changes.Create)+len(changes.Delete)+len(changes.UpdateNew) == 0 {
-		// No op
+	if changes == nil || !changes.HasChanges() {
 		return nil
 	}
 
 	if p.privateZone {
-		return p.applyChangesForPrivateZone(changes)
+		return p.applyChangesForZone(changes)
 	}
 	return p.applyChangesForDNS(changes)
 }
 
-func (p *AlibabaCloudProvider) getDNSName(rr, domain string) string {
-	if rr == nullHostAlibabaCloud {
-		return domain
-	}
-	return rr + "." + domain
-}
-
-// recordsForDNS gets the current records.
+// dnsRecords gets the current records.
 //
 // Returns the current records or an error if the operation failed.
-func (p *AlibabaCloudProvider) recordsForDNS() ([]*endpoint.Endpoint, error) {
-	records, err := p.records()
+func (p *AlibabaCloudProvider) dnsRecords() ([]*endpoint.Endpoint, error) {
+	log.Infof("Retrieving Alibaba Cloud DNS Domain Records")
+	domains, err := p.getDomains()
 	if err != nil {
 		return nil, err
 	}
-	endpoints := make([]*endpoint.Endpoint, 0, len(records))
-	for _, recordList := range p.groupRecords(records) {
-		name := p.getDNSName(recordList[0].RR, recordList[0].DomainName)
-		recordType := recordList[0].Type
-		ttl := recordList[0].TTL
+	endpoints := make([]*endpoint.Endpoint, 0)
 
-		var targets []string
-		for _, record := range recordList {
-			targets = append(targets, record.Value)
+	for _, domain := range domains {
+		records, err := p.getDomainRecords(domain)
+		if err != nil {
+			return nil, err
 		}
-		ep := endpoint.NewEndpointWithTTL(name, recordType, endpoint.TTL(ttl), targets...)
-		endpoints = append(endpoints, ep)
+
+		endpointMap := make(map[string]*endpoint.Endpoint)
+		for _, record := range records {
+			if !provider.SupportedRecordType(record.Type) {
+				continue
+			}
+			dnsname := getDNSName(record.RR, domain)
+			key := toRecordKey(record.Type, dnsname, nil)
+
+			if _, exist := endpointMap[key]; !exist {
+				ttl := endpoint.TTL(record.TTL)
+				endpointMap[key] = endpoint.NewEndpointWithTTL(dnsname, record.Type, ttl, record.Value)
+			} else {
+				endpointMap[key].Targets = append(endpointMap[key].Targets, record.Value)
+			}
+		}
+
+		for _, ep := range endpointMap {
+			endpoints = append(endpoints, ep)
+		}
 	}
+	log.Infof("Found %d Alibaba Cloud DNS record(s).", len(endpoints))
+
 	return endpoints, nil
 }
 
-func getNextPageNumber(pageNumber, totalCount int64) int64 {
-	if pageNumber*defaultAlibabaCloudPageSize >= totalCount {
-		return 0
-	}
-	return pageNumber + 1
-}
-
-func (p *AlibabaCloudProvider) getRecordKey(record alidns.Record) string {
-	if record.RR == nullHostAlibabaCloud {
-		return record.Type + ":" + record.DomainName
-	}
-	return record.Type + ":" + record.RR + "." + record.DomainName
-}
-
-func (p *AlibabaCloudProvider) getRecordKeyByEndpoint(endpoint *endpoint.Endpoint) string {
-	return endpoint.RecordType + ":" + endpoint.DNSName
-}
-
-func (p *AlibabaCloudProvider) groupRecords(records []alidns.Record) map[string][]alidns.Record {
-	endpointMap := make(map[string][]alidns.Record)
-	for _, record := range records {
-		key := p.getRecordKey(record)
-
-		recordList := endpointMap[key]
-		endpointMap[key] = append(recordList, record)
-	}
-	return endpointMap
-}
-
-func (p *AlibabaCloudProvider) records() ([]alidns.Record, error) {
-	log.Infof("Retrieving Alibaba Cloud DNS Domain Records")
-	var results []alidns.Record
-	hostedZoneDomains, err := p.getDomainList()
-	if err != nil {
-		return results, fmt.Errorf("getting domain list: %w", err)
-	}
-	if !p.domainFilter.IsConfigured() {
-		for _, zoneDomain := range hostedZoneDomains {
-			domainRecords, err := p.getDomainRecords(zoneDomain)
-			if err != nil {
-				return nil, fmt.Errorf("getDomainRecords %q: %w", zoneDomain, err)
-			}
-			results = append(results, domainRecords...)
-		}
-	} else {
-		for _, domainName := range p.domainFilter.Filters {
-			_, domainName = p.splitDNSName(domainName, hostedZoneDomains)
-			tmpResults, err := p.getDomainRecords(domainName)
-			if err != nil {
-				log.Errorf("getDomainRecords %s error %v", domainName, err)
-				continue
-			}
-			results = append(results, tmpResults...)
-		}
-	}
-	log.Infof("Found %d Alibaba Cloud DNS record(s).", len(results))
-	return results, nil
-}
-
-func (p *AlibabaCloudProvider) getDomainList() ([]string, error) {
+func (p *AlibabaCloudProvider) getDomains() ([]string, error) {
 	var domainNames []string
 	request := alidns.CreateDescribeDomainsRequest()
-	request.PageSize = requests.NewInteger(defaultAlibabaCloudPageSize)
+	request.PageSize = requests.NewInteger(defaultPageSize)
 	request.PageNumber = "1"
-	request.Scheme = defaultAlibabaCloudRequestScheme
 	for {
 		resp, err := p.dnsClient.DescribeDomains(request)
 		if err != nil {
 			log.Errorf("Failed to describe domains for Alibaba Cloud DNS: %v", err)
 			return nil, err
 		}
-		for _, tmpDomain := range resp.Domains.Domain {
-			domainNames = append(domainNames, tmpDomain.DomainName)
+		for _, item := range resp.Domains.Domain {
+			if !p.domainFilter.IsConfigured() || p.domainFilter.Match(item.DomainName) {
+				domainNames = append(domainNames, item.DomainName)
+			}
 		}
-		nextPage := getNextPageNumber(resp.PageNumber, resp.TotalCount)
-		if nextPage == 0 {
+
+		if int(resp.TotalCount) <= len(domainNames) ||
+			len(resp.Domains.Domain) < defaultPageSize {
 			break
-		} else {
-			request.PageNumber = requests.NewInteger64(nextPage)
 		}
+		request.PageNumber = requests.NewInteger64(resp.PageNumber + 1)
 	}
 	return domainNames, nil
 }
 
-func (p *AlibabaCloudProvider) getDomainRecords(domainName string) ([]alidns.Record, error) {
-	var results []alidns.Record
+func (p *AlibabaCloudProvider) getDomainRecords(domain string) ([]*alidns.Record, error) {
+	var records []*alidns.Record
 	request := alidns.CreateDescribeDomainRecordsRequest()
-	request.DomainName = domainName
-	request.PageSize = requests.NewInteger(defaultAlibabaCloudPageSize)
+	request.DomainName = domain
+	request.PageSize = requests.NewInteger(defaultPageSize)
 	request.PageNumber = "1"
-	request.Scheme = defaultAlibabaCloudRequestScheme
 	for {
-		response, err := p.getDNSClient().DescribeDomainRecords(request)
+		response, err := p.dnsClient.DescribeDomainRecords(request)
 		if err != nil {
 			log.Errorf("Failed to describe domain records for Alibaba Cloud DNS: %v", err)
 			return nil, err
@@ -448,47 +325,540 @@ func (p *AlibabaCloudProvider) getDomainRecords(domainName string) ([]alidns.Rec
 			domainName := record.RR + "." + record.DomainName
 			recordType := record.Type
 
-			if !p.domainFilter.Match(domainName) {
+			if !p.domainFilter.Match(domainName) || !provider.SupportedRecordType(recordType) {
 				continue
 			}
+			// Use the same format as ExternalDNS
+			record.Value = wrapWithQuotes(recordType, record.Value)
+			records = append(records, &record)
+		}
+
+		if response.PageNumber*defaultPageSize >= response.TotalCount ||
+			len(response.DomainRecords.Record) < defaultPageSize {
+			break
+		}
+		request.PageNumber = requests.NewInteger64(response.PageNumber + 1)
+	}
+
+	return records, nil
+}
+
+func (p *AlibabaCloudProvider) applyChangesForDNS(changes *plan.Changes) error {
+	log.Infof("ApplyChanges to Alibaba Cloud DNS: %++v", *changes)
+	domains, err := p.getDomains()
+	if err != nil {
+		return fmt.Errorf("getting domain list: %w", err)
+	}
+
+	domainMapper := provider.ZoneIDName{}
+	recordGroupMap := make(map[string][]*alidns.Record)
+	for _, domain := range domains {
+		domainMapper.Add(domain, domain)
+		if records, err := p.getDomainRecords(domain); err == nil {
+			for _, record := range records {
+				key := toRecordKey(record.Type, domain, &record.RR)
+				recordGroupMap[key] = append(recordGroupMap[key], record)
+			}
+		}
+	}
+
+	var errors []error
+	addEndpoints := slices.Clone(changes.Create)
+	delEndpoints := slices.Clone(changes.Delete)
+	for i, ep := range changes.UpdateNew {
+		key := toEndpointKey(ep)
+		if records, exist := recordGroupMap[key]; exist {
+			_, domain := domainMapper.FindZone(ep.DNSName)
+			p.updateDomainRecords(domain, records, ep)
+			continue
+		}
+		addEndpoints = append(addEndpoints, changes.UpdateNew[i])
+	}
+
+	for _, ep := range delEndpoints {
+		key := toEndpointKey(ep)
+		if records, exist := recordGroupMap[key]; exist {
+			p.deleteDomainRecords(records, ep)
+		}
+	}
+
+	for _, ep := range addEndpoints {
+		_, domain := domainMapper.FindZone(ep.DNSName)
+		p.createDomainRecords(domain, ep)
+	}
+
+	if len(errors) > 0 {
+		log.Errorf("Failed to apply changes to Alibaba Cloud domain DNS: %v", errors)
+	}
+
+	return nil
+}
+
+func (p *AlibabaCloudProvider) createDomainRecords(domain string, ep *endpoint.Endpoint) error {
+	if domain == "" || ep == nil {
+		return fmt.Errorf("Invalid input for creating DNS record")
+	}
+
+	if p.dryRun {
+		log.Infof("Dry run: create Alibaba Cloud domain DNS record %s with endpoint %v", domain, ep)
+		return nil
+	}
+
+	var errs []error
+	var subname = getSubName(ep.DNSName, domain)
+	var ttl = resolveTTL(ep.RecordTTL, defaultDnsTTL)
+	for _, target := range ep.Targets {
+		req := alidns.CreateAddDomainRecordRequest()
+		req.DomainName = domain
+		req.Type = ep.RecordType
+		req.RR = subname
+		req.TTL = ttl
+		req.Value = target
+		if _, err := p.dnsClient.AddDomainRecord(req); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("Failed to create %d records: %v", len(errs), errs)
+	}
+
+	return nil
+}
+
+func (p *AlibabaCloudProvider) updateDomainRecords(domain string, records []*alidns.Record, ep *endpoint.Endpoint) error {
+	if domain == "" || ep == nil {
+		return fmt.Errorf("Invalid input for updating DNS record")
+	}
+
+	if p.dryRun {
+		log.Infof("Dry run: update Alibaba Cloud domain DNS record %s with endpoint %v", domain, ep)
+		return nil
+	}
+
+	var values []string
+	for _, record := range records {
+		values = append(values, record.Value)
+	}
+	var adds []string
+	var dels []string
+	if ep.RecordTTL.IsConfigured() && records[0].TTL != ep.GetRecordTTL() {
+		adds, dels = ep.Targets, values
+	} else {
+		adds, dels, _ = provider.Difference(values, ep.Targets)
+	}
+	slices.Sort(adds)
+	slices.Sort(dels)
+	minlen := min(len(adds), len(dels))
+
+	var errs []error
+	var ttl = resolveTTL(ep.RecordTTL, defaultDnsTTL)
+	if minlen > 0 {
+		for i := range minlen {
+			idx := slices.Index(values, dels[i])
+			if idx >= 0 {
+				req := alidns.CreateUpdateDomainRecordRequest()
+				req.RecordId = records[idx].RecordId
+				req.Value = adds[i]
+				req.TTL = ttl
+				if _, err := p.dnsClient.UpdateDomainRecord(req); err != nil {
+					log.Errorf("Failed to update record '%s' in Alibaba Cloud DNS: %v", req.RecordId, err)
+					errs = append(errs, err)
+				}
+			}
+		}
+	}
+	if len(adds) > minlen {
+		addEP := endpoint.NewEndpointWithTTL(ep.DNSName, ep.RecordType, ep.RecordTTL, adds[minlen:]...)
+		if err := p.createDomainRecords(domain, addEP); err != nil {
+			errs = append(errs, err)
+		}
+	} else if len(dels) > minlen {
+		delEP := endpoint.NewEndpointWithTTL(ep.DNSName, ep.RecordType, ep.RecordTTL, dels[minlen:]...)
+		if err := p.deleteDomainRecords(records, delEP); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("Failed to update %d records: %v", len(errs), errs)
+	}
+
+	return nil
+}
+
+func (p *AlibabaCloudProvider) deleteDomainRecords(records []*alidns.Record, ep *endpoint.Endpoint) error {
+	if len(records) == 0 || ep == nil {
+		return fmt.Errorf("Invalid input for deleting DNS record")
+	}
+	if p.dryRun {
+		log.Infof("Dry run: delete Alibaba Cloud domain DNS records %v with endpoint %v", records, ep)
+		return nil
+	}
+	var errs []error
+	for _, target := range ep.Targets {
+		if idx := slices.IndexFunc(records, func(r *alidns.Record) bool { return r.Value == target }); idx >= 0 {
+			req := alidns.CreateDeleteDomainRecordRequest()
+			req.RecordId = records[idx].RecordId
+			if _, err := p.dnsClient.DeleteDomainRecord(req); err != nil {
+				log.Errorf("Failed to delete record '%s' in Alibaba Cloud DNS: %v", req.RecordId, err)
+				errs = append(errs, err)
+			}
+		} else {
+			log.Errorf("Failed to find %s:%s record with value '%s' to delete", ep.RecordType, ep.DNSName, target)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("Failed to delete %d records: %v", len(errs), errs)
+	}
+
+	return nil
+}
+
+// recordsForPrivateZone gets the current records.
+//
+// Returns the current records or an error if the operation failed.
+func (p *AlibabaCloudProvider) zoneRecords() ([]*endpoint.Endpoint, error) {
+	log.Infof("Retrieving Alibaba Cloud zone DNS records")
+	zones, err := p.getZones()
+	if err != nil {
+		return nil, err
+	}
+
+	endpoints := make([]*endpoint.Endpoint, 0)
+
+	for _, zone := range zones {
+		records, err := p.getZoneRecords(zone.ZoneId)
+		if err != nil {
+			return nil, err
+		}
+
+		endpointMap := make(map[string]*endpoint.Endpoint)
+		for _, record := range records {
+			if !provider.SupportedRecordType(record.Type) {
+				continue
+			}
+
+			dnsname := getDNSName(record.Rr, zone.ZoneName)
+			key := toRecordKey(record.Type, dnsname, nil)
+
+			if _, exist := endpointMap[key]; !exist {
+				ttl := endpoint.TTL(record.Ttl)
+				endpointMap[key] = endpoint.NewEndpointWithTTL(dnsname, record.Type, ttl, record.Value)
+			} else {
+				endpointMap[key].Targets = append(endpointMap[key].Targets, record.Value)
+			}
+		}
+		for _, ep := range endpointMap {
+			endpoints = append(endpoints, ep)
+		}
+	}
+	log.Infof("Found %d Alibaba Cloud zone DNS record(s).", len(endpoints))
+
+	return endpoints, nil
+}
+
+func (p *AlibabaCloudProvider) getZones() ([]pvtz.Zone, error) {
+	var zones []pvtz.Zone
+
+	request := pvtz.CreateDescribeZonesRequest()
+	request.PageSize = requests.NewInteger(defaultPageSize)
+	request.PageNumber = "1"
+	for {
+		response, err := p.pvtzClient.DescribeZones(request)
+		if err != nil {
+			log.Errorf("Failed to describe zones in Alibaba Cloud DNS: %v", err)
+			return nil, err
+		}
+		for _, zone := range response.Zones.Zone {
+			if !p.zoneIDFilter.Match(zone.ZoneId) ||
+				!p.domainFilter.Match(zone.ZoneName) ||
+				!p.matchVPC(zone.ZoneId) {
+				continue
+			}
+			zones = append(zones, zone)
+		}
+		if response.PageNumber*defaultPageSize >= response.TotalItems ||
+			len(response.Zones.Zone) < defaultPageSize {
+			break
+		}
+		request.PageNumber = requests.NewInteger(response.PageNumber + 1)
+	}
+	return zones, nil
+}
+
+func (p *AlibabaCloudProvider) getZoneRecords(zoneId string) ([]*pvtz.Record, error) {
+	log.Infof("Retrieving Alibaba Cloud Private Zone records")
+	var records []*pvtz.Record
+	request := pvtz.CreateDescribeZoneRecordsRequest()
+	request.ZoneId = zoneId
+	request.PageSize = requests.NewInteger(defaultPageSize)
+	request.PageNumber = "1"
+
+	for {
+		response, err := p.pvtzClient.DescribeZoneRecords(request)
+		if err != nil {
+			log.Errorf("Failed to describe zone record '%s' in Alibaba Cloud DNS: %v", zoneId, err)
+			return nil, err
+		}
+
+		for _, record := range response.Records.Record {
+			recordType := record.Type
 			if !provider.SupportedRecordType(recordType) {
 				continue
 			}
 			// Use the same format as ExternalDNS
 			record.Value = wrapWithQuotes(recordType, record.Value)
-			// TODO filter Locked record
-			results = append(results, record)
+			records = append(records, &record)
 		}
-		nextPage := getNextPageNumber(response.PageNumber, response.TotalCount)
-		if nextPage == 0 {
+
+		if response.PageNumber*defaultPageSize >= response.TotalItems ||
+			len(response.Records.Record) < defaultPageSize {
 			break
-		} else {
-			request.PageNumber = requests.NewInteger64(nextPage)
 		}
+		request.PageNumber = requests.NewInteger(response.PageNumber + 1)
 	}
 
-	return results, nil
+	return records, nil
 }
 
-func (p *AlibabaCloudProvider) applyChangesForDNS(changes *plan.Changes) error {
-	log.Infof("ApplyChanges to Alibaba Cloud DNS: %++v", *changes)
-
-	records, err := p.records()
+// ApplyChanges applies the given changes.
+//
+// Returns nil if the operation was successful or an error if the operation failed.
+func (p *AlibabaCloudProvider) applyChangesForZone(changes *plan.Changes) error {
+	log.Infof("ApplyChanges to Alibaba Cloud Private Zone: %++v", *changes)
+	zones, err := p.getZones()
 	if err != nil {
-		return err
+		return fmt.Errorf("getting zone list: %w", err)
 	}
 
-	recordMap := p.groupRecords(records)
-
-	hostedZoneDomains, err := p.getDomainList()
-	if err != nil {
-		return fmt.Errorf("getting domain list: %w", err)
+	zoneMapper := provider.ZoneIDName{}
+	recordGroupMap := make(map[string][]*pvtz.Record)
+	for _, zone := range zones {
+		zoneMapper.Add(zone.ZoneId, zone.ZoneName)
+		if records, err := p.getZoneRecords(zone.ZoneId); err == nil {
+			for _, record := range records {
+				key := toRecordKey(record.Type, zone.ZoneName, &record.Rr)
+				recordGroupMap[key] = append(recordGroupMap[key], record)
+			}
+		}
 	}
 
-	p.createRecords(changes.Create, hostedZoneDomains)
-	p.deleteRecords(recordMap, changes.Delete)
-	p.updateRecords(recordMap, changes.UpdateNew, hostedZoneDomains)
+	var errors []error
+	addEndpoints := slices.Clone(changes.Create)
+	delEndpoints := slices.Clone(changes.Delete)
+	for i, ep := range changes.UpdateNew {
+		key := toEndpointKey(ep)
+		if records, exist := recordGroupMap[key]; exist {
+			zoneId, zoneName := zoneMapper.FindZone(ep.DNSName)
+			p.updateZoneRecords(zoneId, zoneName, records, ep)
+			continue
+		}
+		addEndpoints = append(addEndpoints, changes.UpdateNew[i])
+	}
+
+	for _, ep := range delEndpoints {
+		key := toEndpointKey(ep)
+		if records, exist := recordGroupMap[key]; exist {
+			p.deleteZoneRecords(records, ep)
+		}
+	}
+
+	for _, ep := range addEndpoints {
+		zoneId, zoneName := zoneMapper.FindZone(ep.DNSName)
+		p.createZoneRecords(zoneId, zoneName, ep)
+	}
+
+	if len(errors) > 0 {
+		log.Errorf("Failed to apply changes to Alibaba Cloud zone DNS: %v", errors)
+	}
+
 	return nil
+}
+
+func (p *AlibabaCloudProvider) createZoneRecords(zoneId, zoneName string, ep *endpoint.Endpoint) error {
+	if zoneId == "" || zoneName == "" || ep == nil {
+		return fmt.Errorf("Invalid input for creating zone record")
+	}
+
+	if p.dryRun {
+		log.Infof("Dry run: create Alibaba Cloud domain zone record %s with endpoint %v", zoneName, ep)
+		return nil
+	}
+
+	var errs []error
+	var subname = getSubName(ep.DNSName, zoneName)
+	var ttl = resolveTTL(ep.RecordTTL, defaultPvtTTL)
+	for _, target := range ep.Targets {
+		req := pvtz.CreateAddZoneRecordRequest()
+		req.ZoneId = zoneId
+		req.Type = ep.RecordType
+		req.Rr = subname
+		req.Ttl = ttl
+		req.Value = target
+
+		if _, err := p.pvtzClient.AddZoneRecord(req); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("Failed to create %d records: %v", len(errs), errs)
+	}
+
+	return nil
+}
+
+func (p *AlibabaCloudProvider) updateZoneRecords(zoneId, zoneName string, records []*pvtz.Record, ep *endpoint.Endpoint) error {
+	if zoneId == "" || zoneName == "" || ep == nil {
+		return fmt.Errorf("Invalid input for updating zone record")
+	}
+
+	if p.dryRun {
+		log.Infof("Dry run: update Alibaba Cloud zone DNS records %s with endpoint %v", zoneName, ep)
+		return nil
+	}
+
+	var values []string
+	for _, record := range records {
+		values = append(values, record.Value)
+	}
+	var adds []string
+	var dels []string
+	if ep.RecordTTL.IsConfigured() &&
+		int64(records[0].Ttl) != ep.GetRecordTTL() {
+		adds, dels = ep.Targets, values
+	} else {
+		adds, dels, _ = provider.Difference(values, ep.Targets)
+	}
+	slices.Sort(adds)
+	slices.Sort(dels)
+	minlen := min(len(adds), len(dels))
+
+	var errs []error
+	var ttl = resolveTTL(ep.RecordTTL, defaultDnsTTL)
+	if minlen > 0 {
+		for i := 0; i < minlen; i++ {
+			idx := slices.Index(values, dels[i])
+			if idx >= 0 {
+				req := pvtz.CreateUpdateZoneRecordRequest()
+				req.RecordId = requests.NewInteger64(records[idx].RecordId)
+				req.Value = adds[i]
+				req.Ttl = ttl
+				if _, err := p.pvtzClient.UpdateZoneRecord(req); err != nil {
+					log.Errorf("Failed to update record '%s' in Alibaba Cloud zone DNS: %v", req.RecordId, err)
+					errs = append(errs, err)
+				}
+			}
+		}
+	}
+	if len(adds) > minlen {
+		addEP := endpoint.NewEndpointWithTTL(ep.DNSName, ep.RecordType, ep.RecordTTL, adds[minlen:]...)
+		if err := p.createZoneRecords(zoneId, zoneName, addEP); err != nil {
+			errs = append(errs, err)
+		}
+	} else if len(dels) > minlen {
+		delEP := endpoint.NewEndpointWithTTL(ep.DNSName, ep.RecordType, ep.RecordTTL, dels[minlen:]...)
+		if err := p.deleteZoneRecords(records, delEP); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("Failed to update %d records: %v", len(errs), errs)
+	}
+
+	return nil
+}
+
+func (p *AlibabaCloudProvider) deleteZoneRecords(records []*pvtz.Record, ep *endpoint.Endpoint) error {
+	if len(records) == 0 || ep == nil {
+		return fmt.Errorf("Invalid input for deleting zone DNS record")
+	}
+	if p.dryRun {
+		log.Infof("Dry run: delete Alibaba Cloud zone DNS records %v with endpoint %v", records, ep)
+		return nil
+	}
+	var errs []error
+	for _, target := range ep.Targets {
+		if idx := slices.IndexFunc(records, func(r *pvtz.Record) bool { return r.Value == target }); idx >= 0 {
+			req := pvtz.CreateDeleteZoneRecordRequest()
+			req.RecordId = requests.NewInteger64(records[idx].RecordId)
+			if _, err := p.pvtzClient.DeleteZoneRecord(req); err != nil {
+				log.Errorf("Failed to delete record '%s' in Alibaba Cloud DNS: %v", req.RecordId, err)
+				errs = append(errs, err)
+			}
+		} else {
+			log.Errorf("Failed to find %s:%s record with value '%s' to delete", ep.RecordType, ep.DNSName, target)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("Failed to delete %d records: %v", len(errs), errs)
+	}
+
+	return nil
+}
+
+func (p *AlibabaCloudProvider) matchVPC(zoneID string) bool {
+	if p.vpcID == "" || zoneID == "" {
+		return true
+	}
+	request := pvtz.CreateDescribeZoneInfoRequest()
+	request.ZoneId = zoneID
+	response, err := p.pvtzClient.DescribeZoneInfo(request)
+	if err != nil {
+		log.Errorf("Failed to describe zone info %s in Alibaba Cloud DNS: %v", zoneID, err)
+		return false
+	}
+	for _, vpc := range response.BindVpcs.Vpc {
+		if vpc.VpcId == p.vpcID {
+			return true
+		}
+	}
+	return false
+}
+
+func toRecordKey(recordType, domain string, subname *string) string {
+	if subname != nil {
+		domain = getDNSName(*subname, domain)
+	}
+	return fmt.Sprintf("%s:%s", recordType, domain)
+}
+
+func toEndpointKey(ep *endpoint.Endpoint) string {
+	return fmt.Sprintf("%s:%s", ep.RecordType, ep.DNSName)
+}
+
+func resolveTTL(ttl endpoint.TTL, defaultTTL int) requests.Integer {
+	if ttl.IsConfigured() {
+		return requests.NewInteger64(int64(ttl))
+	}
+	return requests.NewInteger(int(defaultTTL))
+}
+
+func getSubName(dnsname, domain string) string {
+	name := strings.TrimSuffix(dnsname, ".")
+	name = strings.TrimSuffix(name, strings.TrimSuffix(domain, "."))
+	name = strings.TrimSuffix(name, ".")
+
+	if name == "" {
+		return apexRecord
+	}
+	return name
+}
+
+func getDNSName(subname, domain string) string {
+	subname = strings.Trim(subname, ".")
+	domain = strings.Trim(domain, ".")
+	if subname == apexRecord || subname == "" {
+		return domain
+	}
+	if domain == "" {
+		return subname
+	}
+	return subname + "." + domain
 }
 
 func unwrapQuotes(recordType, target string) string {
@@ -499,534 +869,10 @@ func unwrapQuotes(recordType, target string) string {
 }
 
 func wrapWithQuotes(recordType, value string) string {
-	if recordType == endpoint.RecordTypeTXT && strings.HasPrefix(value, "heritage=") {
+	if recordType == endpoint.RecordTypeTXT && strings.HasPrefix(value, `heritage=`) {
 		// Alibaba Cloud returns TXT record values without quotes.
 		// Restore the quotes to match ExternalDNS's expected format.
-		return fmt.Sprintf("\"%s\"", value)
+		return fmt.Sprintf("%q", value)
 	}
 	return value
-}
-
-func (p *AlibabaCloudProvider) createRecord(endpoint *endpoint.Endpoint, target string, hostedZoneDomains []string) error {
-	if len(hostedZoneDomains) == 0 {
-		log.Errorf("Failed to create %s record named '%s' to '%s' for Alibaba Cloud DNS: zone not found",
-			endpoint.RecordType, endpoint.DNSName, target)
-		return fmt.Errorf("zone not found")
-	}
-
-	rr, domain := p.splitDNSName(endpoint.DNSName, hostedZoneDomains)
-
-	if domain == "" {
-		log.Errorf("Failed to create %s record named '%s' to '%s' for Alibaba Cloud DNS: no corresponding DNS zone found for this domain '%s'",
-			endpoint.RecordType, endpoint.DNSName, target, endpoint.DNSName)
-		return fmt.Errorf("no corresponding DNS zone found for this domain")
-	}
-
-	request := alidns.CreateAddDomainRecordRequest()
-	request.DomainName = domain
-	request.Type = endpoint.RecordType
-	request.RR = rr
-	request.Scheme = defaultAlibabaCloudRequestScheme
-
-	ttl := int(endpoint.RecordTTL)
-	if ttl != 0 {
-		request.TTL = requests.NewInteger(ttl)
-	}
-
-	request.Value = target
-
-	if p.dryRun {
-		log.Infof("Dry run: Create %s record named '%s' to '%s' with ttl %d for Alibaba Cloud DNS", endpoint.RecordType, endpoint.DNSName, target, ttl)
-		return nil
-	}
-
-	response, err := p.getDNSClient().AddDomainRecord(request)
-	if err == nil {
-		log.Infof("Create %s record named '%s' to '%s' with ttl %d for Alibaba Cloud DNS: Record ID=%s", endpoint.RecordType, endpoint.DNSName, target, ttl, response.RecordId)
-	} else {
-		log.Errorf("Failed to create %s record named '%s' to '%s' with ttl %d for Alibaba Cloud DNS: %v", endpoint.RecordType, endpoint.DNSName, target, ttl, err)
-	}
-	return err
-}
-
-func (p *AlibabaCloudProvider) createRecords(endpoints []*endpoint.Endpoint, hostedZoneDomains []string) {
-	for _, endpoint := range endpoints {
-		for _, target := range endpoint.Targets {
-			p.createRecord(endpoint, target, hostedZoneDomains)
-		}
-	}
-}
-
-func (p *AlibabaCloudProvider) deleteRecord(recordID string) error {
-	if p.dryRun {
-		log.Infof("Dry run: Delete record id '%s' in Alibaba Cloud DNS", recordID)
-		return nil
-	}
-
-	request := alidns.CreateDeleteDomainRecordRequest()
-	request.RecordId = recordID
-	request.Scheme = defaultAlibabaCloudRequestScheme
-	response, err := p.getDNSClient().DeleteDomainRecord(request)
-	if err == nil {
-		log.Infof("Delete record id %s in Alibaba Cloud DNS", response.RecordId)
-	} else {
-		log.Errorf("Failed to delete record '%s' in Alibaba Cloud DNS: %v", response.RecordId, err)
-	}
-	return err
-}
-
-func (p *AlibabaCloudProvider) updateRecord(record alidns.Record, endpoint *endpoint.Endpoint) error {
-	request := alidns.CreateUpdateDomainRecordRequest()
-	request.RecordId = record.RecordId
-	request.RR = record.RR
-	request.Type = record.Type
-	request.Value = record.Value
-	request.Scheme = defaultAlibabaCloudRequestScheme
-	ttl := int(endpoint.RecordTTL)
-	if ttl != 0 {
-		request.TTL = requests.NewInteger(ttl)
-	}
-	response, err := p.getDNSClient().UpdateDomainRecord(request)
-	if err == nil {
-		log.Infof("Update record id '%s' in Alibaba Cloud DNS", response.RecordId)
-	} else {
-		log.Errorf("Failed to update record '%s' in Alibaba Cloud DNS: %v", response.RecordId, err)
-	}
-	return err
-}
-
-func (p *AlibabaCloudProvider) deleteRecords(recordMap map[string][]alidns.Record, endpoints []*endpoint.Endpoint) {
-	for _, endpoint := range endpoints {
-		key := p.getRecordKeyByEndpoint(endpoint)
-		records := recordMap[key]
-		found := false
-		for _, record := range records {
-			if slices.Contains(endpoint.Targets, record.Value) {
-				p.deleteRecord(record.RecordId)
-				found = true
-			}
-		}
-		if !found {
-			log.Errorf("Failed to find %s record named '%s' to delete for Alibaba Cloud DNS", endpoint.RecordType, endpoint.DNSName)
-		}
-	}
-}
-
-func (p *AlibabaCloudProvider) equals(record alidns.Record, endpoint *endpoint.Endpoint) bool {
-	ttl1 := record.TTL
-	if ttl1 == defaultTTL {
-		ttl1 = 0
-	}
-
-	ttl2 := int64(endpoint.RecordTTL)
-	if ttl2 == defaultTTL {
-		ttl2 = 0
-	}
-
-	return ttl1 == ttl2
-}
-
-func (p *AlibabaCloudProvider) updateRecords(recordMap map[string][]alidns.Record, endpoints []*endpoint.Endpoint, hostedZoneDomains []string) {
-	for _, endpoint := range endpoints {
-		key := p.getRecordKeyByEndpoint(endpoint)
-		records := recordMap[key]
-		for _, record := range records {
-			found := slices.Contains(endpoint.Targets, record.Value)
-			if found {
-				if !p.equals(record, endpoint) {
-					// Update record
-					p.updateRecord(record, endpoint)
-				}
-			} else {
-				p.deleteRecord(record.RecordId)
-			}
-		}
-		for _, target := range endpoint.Targets {
-			found := slices.ContainsFunc(records, func(record alidns.Record) bool {
-				return record.Value == target
-			})
-			if !found {
-				p.createRecord(endpoint, target, hostedZoneDomains)
-			}
-		}
-	}
-}
-
-func (p *AlibabaCloudProvider) splitDNSName(dnsName string, hostedZoneDomains []string) (string, string) {
-	name := strings.TrimSuffix(dnsName, ".")
-
-	// sort zones by dot count; make sure subdomains sort earlier
-	sort.Slice(hostedZoneDomains, func(i, j int) bool {
-		return strings.Count(hostedZoneDomains[i], ".") > strings.Count(hostedZoneDomains[j], ".")
-	})
-
-	var rr, domain string
-
-	for _, filter := range hostedZoneDomains {
-		if strings.HasSuffix(name, "."+filter) {
-			rr = name[0 : len(name)-len(filter)-1]
-			domain = filter
-			break
-		} else if name == filter {
-			domain = filter
-			rr = ""
-		}
-	}
-
-	if rr == "" {
-		rr = nullHostAlibabaCloud
-	}
-	return rr, domain
-}
-
-func (p *AlibabaCloudProvider) matchVPC(zoneID string) bool {
-	request := pvtz.CreateDescribeZoneInfoRequest()
-	request.ZoneId = zoneID
-	request.Domain = pVTZDoamin
-	request.Scheme = defaultAlibabaCloudRequestScheme
-	response, err := p.getPvtzClient().DescribeZoneInfo(request)
-	if err != nil {
-		log.Errorf("Failed to describe zone info %s in Alibaba Cloud DNS: %v", zoneID, err)
-		return false
-	}
-	foundVPC := false
-	for _, vpc := range response.BindVpcs.Vpc {
-		if vpc.VpcId == p.vpcID {
-			foundVPC = true
-			break
-		}
-	}
-	return foundVPC
-}
-
-func (p *AlibabaCloudProvider) privateZones() ([]pvtz.Zone, error) {
-	var zones []pvtz.Zone
-
-	request := pvtz.CreateDescribeZonesRequest()
-	request.PageSize = requests.NewInteger(defaultAlibabaCloudPageSize)
-	request.PageNumber = "1"
-	request.Domain = pVTZDoamin
-	request.Scheme = defaultAlibabaCloudRequestScheme
-	for {
-		response, err := p.getPvtzClient().DescribeZones(request)
-		if err != nil {
-			log.Errorf("Failed to describe zones in Alibaba Cloud DNS: %v", err)
-			return nil, err
-		}
-		for _, zone := range response.Zones.Zone {
-			log.Infof("PrivateZones zone: %++v", zone)
-
-			if !p.zoneIDFilter.Match(zone.ZoneId) {
-				continue
-			}
-			if !p.domainFilter.Match(zone.ZoneName) {
-				continue
-			}
-			if !p.matchVPC(zone.ZoneId) {
-				continue
-			}
-			zones = append(zones, zone)
-		}
-		nextPage := getNextPageNumber(int64(response.PageNumber), int64(response.TotalItems))
-		if nextPage == 0 {
-			break
-		} else {
-			request.PageNumber = requests.NewInteger64(nextPage)
-		}
-	}
-	return zones, nil
-}
-
-type alibabaPrivateZone struct {
-	pvtz.Zone
-	records []pvtz.Record
-}
-
-func (p *AlibabaCloudProvider) getPrivateZones() (map[string]*alibabaPrivateZone, error) {
-	log.Infof("Retrieving Alibaba Cloud Private Zone records")
-
-	result := make(map[string]*alibabaPrivateZone)
-	recordsCount := 0
-
-	zones, err := p.privateZones()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, zone := range zones {
-		request := pvtz.CreateDescribeZoneRecordsRequest()
-		request.ZoneId = zone.ZoneId
-		request.PageSize = requests.NewInteger(defaultAlibabaCloudPageSize)
-		request.PageNumber = "1"
-		request.Domain = pVTZDoamin
-		request.Scheme = defaultAlibabaCloudRequestScheme
-		var records []pvtz.Record
-
-		for {
-			response, err := p.getPvtzClient().DescribeZoneRecords(request)
-			if err != nil {
-				log.Errorf("Failed to describe zone record '%s' in Alibaba Cloud DNS: %v", zone.ZoneId, err)
-				return nil, err
-			}
-
-			for _, record := range response.Records.Record {
-				recordType := record.Type
-
-				if !provider.SupportedRecordType(recordType) {
-					continue
-				}
-
-				// Use the same format as ExternalDNS
-				record.Value = wrapWithQuotes(recordType, record.Value)
-				// TODO filter Locked
-				records = append(records, record)
-			}
-			nextPage := getNextPageNumber(int64(response.PageNumber), int64(response.TotalItems))
-			if nextPage == 0 {
-				break
-			} else {
-				request.PageNumber = requests.NewInteger64(nextPage)
-			}
-		}
-
-		privateZone := alibabaPrivateZone{
-			Zone:    zone,
-			records: records,
-		}
-		recordsCount += len(records)
-		result[zone.ZoneName] = &privateZone
-	}
-	log.Infof("Found %d Alibaba Cloud Private Zone record(s).", recordsCount)
-	return result, nil
-}
-
-func (p *AlibabaCloudProvider) groupPrivateZoneRecords(zone *alibabaPrivateZone) map[string][]pvtz.Record {
-	endpointMap := make(map[string][]pvtz.Record)
-
-	for _, record := range zone.records {
-		key := record.Type + ":" + record.Rr
-		recordList := endpointMap[key]
-		endpointMap[key] = append(recordList, record)
-	}
-
-	return endpointMap
-}
-
-// recordsForPrivateZone gets the current records.
-//
-// Returns the current records or an error if the operation failed.
-func (p *AlibabaCloudProvider) privateZoneRecords() ([]*endpoint.Endpoint, error) {
-	zones, err := p.getPrivateZones()
-	if err != nil {
-		return nil, err
-	}
-
-	endpoints := make([]*endpoint.Endpoint, 0)
-
-	for _, zone := range zones {
-		recordMap := p.groupPrivateZoneRecords(zone)
-		for _, recordList := range recordMap {
-			name := p.getDNSName(recordList[0].Rr, zone.ZoneName)
-			recordType := recordList[0].Type
-			ttl := recordList[0].Ttl
-			if ttl == defaultAlibabaCloudPrivateZoneRecordTTL {
-				ttl = 0
-			}
-			var targets []string
-			for _, record := range recordList {
-				targets = append(targets, record.Value)
-			}
-			ep := endpoint.NewEndpointWithTTL(name, recordType, endpoint.TTL(ttl), targets...)
-			endpoints = append(endpoints, ep)
-		}
-	}
-	return endpoints, nil
-}
-
-func (p *AlibabaCloudProvider) createPrivateZoneRecord(zones map[string]*alibabaPrivateZone, endpoint *endpoint.Endpoint, target string) error {
-	rr, domain := p.splitDNSName(endpoint.DNSName, keys(zones))
-	zone := zones[domain]
-	if zone == nil {
-		err := fmt.Errorf("failed to find private zone '%s'", domain)
-		log.Errorf("Failed to create %s record named '%s' to '%s' for Alibaba Cloud Private Zone: %v", endpoint.RecordType, endpoint.DNSName, target, err)
-		return err
-	}
-
-	request := pvtz.CreateAddZoneRecordRequest()
-	request.ZoneId = zone.ZoneId
-	request.Type = endpoint.RecordType
-	request.Rr = rr
-	request.Domain = pVTZDoamin
-	request.Scheme = defaultAlibabaCloudRequestScheme
-
-	ttl := int(endpoint.RecordTTL)
-	if ttl != 0 {
-		request.Ttl = requests.NewInteger(ttl)
-	}
-
-	request.Value = target
-
-	if p.dryRun {
-		log.Infof("Dry run: Create %s record named '%s' to '%s' with ttl %d for Alibaba Cloud Private Zone", endpoint.RecordType, endpoint.DNSName, target, ttl)
-		return nil
-	}
-
-	response, err := p.getPvtzClient().AddZoneRecord(request)
-	if err == nil {
-		log.Infof("Create %s record named '%s' to '%s' with ttl %d for Alibaba Cloud Private Zone: Record ID=%d", endpoint.RecordType, endpoint.DNSName, target, ttl, response.RecordId)
-	} else {
-		log.Errorf("Failed to create %s record named '%s' to '%s' with ttl %d for Alibaba Cloud Private Zone: %v", endpoint.RecordType, endpoint.DNSName, target, ttl, err)
-	}
-	return err
-}
-
-func (p *AlibabaCloudProvider) createPrivateZoneRecords(zones map[string]*alibabaPrivateZone, endpoints []*endpoint.Endpoint) {
-	for _, endpoint := range endpoints {
-		for _, target := range endpoint.Targets {
-			_ = p.createPrivateZoneRecord(zones, endpoint, target)
-		}
-	}
-}
-
-func (p *AlibabaCloudProvider) deletePrivateZoneRecord(recordID int64) error {
-	if p.dryRun {
-		log.Infof("Dry run: Delete record id '%d' in Alibaba Cloud Private Zone", recordID)
-	}
-
-	request := pvtz.CreateDeleteZoneRecordRequest()
-	request.RecordId = requests.NewInteger64(recordID)
-	request.Domain = pVTZDoamin
-	request.Scheme = defaultAlibabaCloudRequestScheme
-
-	response, err := p.getPvtzClient().DeleteZoneRecord(request)
-	if err == nil {
-		log.Infof("Delete record id '%d' in Alibaba Cloud Private Zone", response.RecordId)
-	} else {
-		log.Errorf("Failed to delete record %d in Alibaba Cloud Private Zone: %v", response.RecordId, err)
-	}
-	return err
-}
-
-func (p *AlibabaCloudProvider) deletePrivateZoneRecords(zones map[string]*alibabaPrivateZone, endpoints []*endpoint.Endpoint) {
-	zoneNames := keys(zones)
-	for _, endpoint := range endpoints {
-		rr, domain := p.splitDNSName(endpoint.DNSName, zoneNames)
-
-		zone := zones[domain]
-		if zone == nil {
-			log.Errorf("Failed to delete %s record named '%s' for Alibaba Cloud Private Zone: failed to find private zone '%s'", endpoint.RecordType, endpoint.DNSName, domain)
-			continue
-		}
-		found := false
-		for _, record := range zone.records {
-			if rr == record.Rr && endpoint.RecordType == record.Type {
-				if slices.Contains(endpoint.Targets, record.Value) {
-					p.deletePrivateZoneRecord(record.RecordId)
-					found = true
-				}
-			}
-		}
-		if !found {
-			log.Errorf("Failed to find %s record named '%s' to delete for Alibaba Cloud Private Zone", endpoint.RecordType, endpoint.DNSName)
-		}
-	}
-}
-
-// ApplyChanges applies the given changes.
-//
-// Returns nil if the operation was successful or an error if the operation failed.
-func (p *AlibabaCloudProvider) applyChangesForPrivateZone(changes *plan.Changes) error {
-	log.Infof("ApplyChanges to Alibaba Cloud Private Zone: %++v", *changes)
-
-	zones, err := p.getPrivateZones()
-	if err != nil {
-		return err
-	}
-
-	for zoneName, zone := range zones {
-		log.Debugf("%s: %++v", zoneName, zone)
-	}
-
-	p.createPrivateZoneRecords(zones, changes.Create)
-	p.deletePrivateZoneRecords(zones, changes.Delete)
-	p.updatePrivateZoneRecords(zones, changes.UpdateNew)
-	return nil
-}
-
-func (p *AlibabaCloudProvider) updatePrivateZoneRecord(record pvtz.Record, endpoint *endpoint.Endpoint) error {
-	request := pvtz.CreateUpdateZoneRecordRequest()
-	request.RecordId = requests.NewInteger64(record.RecordId)
-	request.Rr = record.Rr
-	request.Type = record.Type
-	request.Value = record.Value
-	request.Domain = pVTZDoamin
-	request.Scheme = defaultAlibabaCloudRequestScheme
-	ttl := int(endpoint.RecordTTL)
-	if ttl != 0 {
-		request.Ttl = requests.NewInteger(ttl)
-	}
-	response, err := p.getPvtzClient().UpdateZoneRecord(request)
-	if err == nil {
-		log.Infof("Update record id '%d' in Alibaba Cloud Private Zone", response.RecordId)
-	} else {
-		log.Errorf("Failed to update record '%d' in Alibaba Cloud Private Zone: %v", response.RecordId, err)
-	}
-	return err
-}
-
-func (p *AlibabaCloudProvider) equalsPrivateZone(record pvtz.Record, endpoint *endpoint.Endpoint) bool {
-	ttl1 := record.Ttl
-	if ttl1 == defaultAlibabaCloudPrivateZoneRecordTTL {
-		ttl1 = 0
-	}
-
-	ttl2 := int(endpoint.RecordTTL)
-	if ttl2 == defaultAlibabaCloudPrivateZoneRecordTTL {
-		ttl2 = 0
-	}
-
-	return ttl1 == ttl2
-}
-
-func (p *AlibabaCloudProvider) updatePrivateZoneRecords(zones map[string]*alibabaPrivateZone, endpoints []*endpoint.Endpoint) {
-	zoneNames := keys(zones)
-	for _, endpoint := range endpoints {
-		rr, domain := p.splitDNSName(endpoint.DNSName, zoneNames)
-		zone := zones[domain]
-		if zone == nil {
-			log.Errorf("Failed to update %s record named '%s' for Alibaba Cloud Private Zone: failed to find private zone '%s'", endpoint.RecordType, endpoint.DNSName, domain)
-			continue
-		}
-
-		for _, record := range zone.records {
-			if record.Rr != rr || record.Type != endpoint.RecordType {
-				continue
-			}
-			found := slices.Contains(endpoint.Targets, record.Value)
-			if found {
-				if !p.equalsPrivateZone(record, endpoint) {
-					// Update record
-					p.updatePrivateZoneRecord(record, endpoint)
-				}
-			} else {
-				p.deletePrivateZoneRecord(record.RecordId)
-			}
-		}
-		for _, target := range endpoint.Targets {
-			found := slices.ContainsFunc(zone.records, func(record pvtz.Record) bool {
-				return record.Rr == rr && record.Type == endpoint.RecordType && record.Value == target
-			})
-			if !found {
-				p.createPrivateZoneRecord(zones, endpoint, target)
-			}
-		}
-	}
-}
-
-func keys[T any](value map[string]T) []string {
-	var results []string
-	for k := range value {
-		results = append(results, k)
-	}
-	return results
 }

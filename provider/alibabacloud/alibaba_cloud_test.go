@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -157,7 +156,7 @@ func (m *MockAlibabaCloudDNSAPI) nextID() string {
 }
 
 func (m *MockAlibabaCloudDNSAPI) newRecord(ep *endpoint.Endpoint, target, domain string) *alidns.Record {
-	subname := getSubname(domain, ep)
+	subname := getSubName(ep.DNSName, domain)
 	value := unwrapQuotes(ep.RecordType, target)
 
 	return &alidns.Record{
@@ -313,7 +312,7 @@ func (m *MockAlibabaCloudPrivateZoneAPI) nextID() int64 {
 }
 
 func (m *MockAlibabaCloudPrivateZoneAPI) newRecord(ep *endpoint.Endpoint, target, domain, zoneId string) *pvtz.Record {
-	subname := getSubname(domain, ep)
+	subname := getSubName(ep.DNSName, domain)
 	value := unwrapQuotes(ep.RecordType, target)
 
 	return &pvtz.Record{
@@ -404,17 +403,6 @@ func newTestAlibabaCloudProviderWithConfig(domainFilter *endpoint.DomainFilter, 
 	}
 }
 
-func getSubname(domain string, ep *endpoint.Endpoint) string {
-	name := strings.TrimSuffix(ep.DNSName, ".")
-	name = strings.TrimSuffix(name, strings.TrimSuffix(domain, "."))
-	name = strings.TrimSuffix(name, ".")
-
-	if name == "" {
-		return "@"
-	}
-	return name
-}
-
 func createDefaultEndpoints(domain string) []*endpoint.Endpoint {
 	endpoints := []*endpoint.Endpoint{
 		endpoint.NewEndpointWithTTL("abc."+domain, "A", 300, "1.2.3.4"),
@@ -445,7 +433,7 @@ func TestAlibabaCloudProvider_ApplyChanges(t *testing.T) {
 	changes := plan.Changes{
 		Create: []*endpoint.Endpoint{
 			endpoint.NewEndpointWithTTL("xyz.container-service.top", "A", 300, "4.3.2.1"),
-			endpoint.NewEndpointWithTTL("ttl.container-service.top", "A", defaultTTL, "4.3.2.1"),
+			endpoint.NewEndpointWithTTL("ttl.container-service.top", "A", defaultDnsTTL, "4.3.2.1"),
 		},
 		UpdateNew: []*endpoint.Endpoint{
 			endpoint.NewEndpointWithTTL("abc.container-service.top", "A", 500, "1.2.3.4", "5.6.7.8"),
@@ -479,7 +467,7 @@ func TestAlibabaCloudProvider_ApplyChanges_UndefinedZoneDomain(t *testing.T) {
 			// no found this zone by API: DescribeDomains
 			endpoint.NewEndpointWithTTL("www.example.com", "A", 300, "9.9.9.9"),
 			// can create this domain record
-			endpoint.NewEndpointWithTTL("ttl.container-service.top", "A", defaultTTL, "4.3.2.1"),
+			endpoint.NewEndpointWithTTL("ttl.container-service.top", "A", defaultDnsTTL, "4.3.2.1"),
 		},
 		UpdateNew: []*endpoint.Endpoint{
 			endpoint.NewEndpointWithTTL("abc.container-service.top", "A", 500, "1.2.3.4", "5.6.7.8"),
@@ -551,75 +539,7 @@ func TestAlibabaCloudProvider_PrivateZone_ApplyChanges(t *testing.T) {
 	assert.True(t, testutils.SameEndpoints(changedEndpoints, endpoints), "expected and actual endpoints don't match. %s:%s", changedEndpoints, endpoints)
 }
 
-func TestAlibabaCloudProvider_splitDNSName(t *testing.T) {
-	p := newTestAlibabaCloudProvider(false)
-	endpoint := &endpoint.Endpoint{}
-	hostedZoneDomains := []string{"container-service.top", "example.org"}
-
-	var emptyZoneDomains []string
-
-	endpoint.DNSName = "www.example.org"
-	rr, domain := p.splitDNSName(endpoint.DNSName, hostedZoneDomains)
-	if rr != "www" || domain != "example.org" {
-		t.Errorf("Failed to splitDNSName for %s: rr=%s, domain=%s", endpoint.DNSName, rr, domain)
-	}
-	endpoint.DNSName = ".example.org"
-	rr, domain = p.splitDNSName(endpoint.DNSName, hostedZoneDomains)
-	if rr != "@" || domain != "example.org" {
-		t.Errorf("Failed to splitDNSName for %s: rr=%s, domain=%s", endpoint.DNSName, rr, domain)
-	}
-	endpoint.DNSName = "www"
-	rr, domain = p.splitDNSName(endpoint.DNSName, hostedZoneDomains)
-	if rr != "@" || domain != "" {
-		t.Errorf("Failed to splitDNSName for %s: rr=%s, domain=%s", endpoint.DNSName, rr, domain)
-	}
-	endpoint.DNSName = ""
-	rr, domain = p.splitDNSName(endpoint.DNSName, hostedZoneDomains)
-	if rr != "@" || domain != "" {
-		t.Errorf("Failed to splitDNSName for %s: rr=%s, domain=%s", endpoint.DNSName, rr, domain)
-	}
-	endpoint.DNSName = "_30000._tcp.container-service.top"
-	rr, domain = p.splitDNSName(endpoint.DNSName, hostedZoneDomains)
-	if rr != "_30000._tcp" || domain != "container-service.top" {
-		t.Errorf("Failed to splitDNSName for %s: rr=%s, domain=%s", endpoint.DNSName, rr, domain)
-	}
-	endpoint.DNSName = "container-service.top"
-	rr, domain = p.splitDNSName(endpoint.DNSName, hostedZoneDomains)
-	if rr != "@" || domain != "container-service.top" {
-		t.Errorf("Failed to splitDNSName for %s: rr=%s, domain=%s", endpoint.DNSName, rr, domain)
-	}
-	endpoint.DNSName = "a.b.container-service.top"
-	rr, domain = p.splitDNSName(endpoint.DNSName, hostedZoneDomains)
-	if rr != "a.b" || domain != "container-service.top" {
-		t.Errorf("Failed to splitDNSName for %s: rr=%s, domain=%s", endpoint.DNSName, rr, domain)
-	}
-	endpoint.DNSName = "a.b.c.container-service.top"
-	rr, domain = p.splitDNSName(endpoint.DNSName, hostedZoneDomains)
-	if rr != "a.b.c" || domain != "container-service.top" {
-		t.Errorf("Failed to splitDNSName for %s: rr=%s, domain=%s", endpoint.DNSName, rr, domain)
-	}
-	endpoint.DNSName = "a.b.c.container-service.top"
-	rr, domain = p.splitDNSName(endpoint.DNSName, []string{"c.container-service.top"})
-	if rr != "a.b" || domain != "c.container-service.top" {
-		t.Errorf("Failed to splitDNSName for %s: rr=%s, domain=%s", endpoint.DNSName, rr, domain)
-	}
-
-	endpoint.DNSName = "a.b.c.container-service.top"
-	rr, domain = p.splitDNSName(endpoint.DNSName, []string{"container-service.top", "c.container-service.top"})
-	if rr != "a.b" || domain != "c.container-service.top" {
-		t.Errorf("Failed to splitDNSName for %s: rr=%s, domain=%s", endpoint.DNSName, rr, domain)
-	}
-	rr, domain = p.splitDNSName(endpoint.DNSName, emptyZoneDomains)
-	if rr != "@" || domain != "" {
-		t.Errorf("Failed to splitDNSName with emptyZoneDomains for %s: rr=%s, domain=%s", endpoint.DNSName, rr, domain)
-	}
-	rr, domain = p.splitDNSName(endpoint.DNSName, []string{"example.com"})
-	if rr != "@" || domain != "" {
-		t.Errorf("Failed to splitDNSName for %s: rr=%s, domain=%s", endpoint.DNSName, rr, domain)
-	}
-}
-
-func TestAlibabaCloudProvider_TXTEndpoint(t *testing.T) {
+func TestAlibabaCloudProvider_TXTRecord(t *testing.T) {
 	const recordValue = "heritage=external-dns,external-dns/owner=default"
 	const endpointTarget = "\"heritage=external-dns,external-dns/owner=default\""
 

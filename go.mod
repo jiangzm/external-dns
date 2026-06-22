@@ -1,6 +1,6 @@
 module sigs.k8s.io/external-dns
 
-go 1.26.1
+go 1.26.5
 
 require (
 	cloud.google.com/go/compute/metadata v0.9.0
@@ -24,7 +24,6 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/civo/civogo v0.7.2
 	github.com/cloudflare/cloudflare-go/v5 v5.1.0
-	github.com/denverdino/aliyungo v0.0.0-20230411124812-ab98a9173ace
 	github.com/dnsimple/dnsimple-go v1.7.0
 	github.com/emissary-ingress/emissary/v3 v3.10.0
 	github.com/exoscale/egoscale/v3 v3.1.37
@@ -70,6 +69,8 @@ require (
 	sigs.k8s.io/gateway-api v1.5.1
 	sigs.k8s.io/yaml v1.6.0
 )
+
+replace moul.io/http2curl => moul.io/http2curl/v2 v2.3.0
 
 require (
 	cloud.google.com/go/auth v0.20.0 // indirect
